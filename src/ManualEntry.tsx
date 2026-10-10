@@ -1,0 +1,37 @@
+import {useState} from 'react';
+import {db} from './db';
+
+type Product={id:string;name:string;barcode?:string;unit?:string;stock?:number;cost?:number;average_cost?:number;price?:number};
+type Supplier={id:string;name:string};
+type Item={key:number;product_id:string;barcode:string;description:string;unit:string;quantity:number;received_quantity:number;unit_cost:number};
+const brl=(n:number)=>n.toLocaleString('pt-BR',{style:'currency',currency:'BRL'});
+export default function ManualEntry({products,suppliers,onSaved}:{products:Product[];suppliers:Supplier[];onSaved:()=>Promise<void>}){
+ const [number,setNumber]=useState(''),[kind,setKind]=useState('MANUAL'),[supplierId,setSupplierId]=useState(''),[issueDate,setIssueDate]=useState(new Date().toISOString().slice(0,10));
+ const [items,setItems]=useState<Item[]>([]),[busy,setBusy]=useState(false),[error,setError]=useState(''),[message,setMessage]=useState('');
+ const [newProduct,setNewProduct]=useState<{key:number;barcode:string}|null>(null),[newName,setNewName]=useState(''),[newUnit,setNewUnit]=useState('UN');
+ const setItem=(key:number,patch:Partial<Item>)=>setItems(old=>old.map(i=>i.key===key?{...i,...patch}:i));
+ const add=()=>setItems(old=>[...old,{key:Date.now()+Math.random(),product_id:'',barcode:'',description:'',unit:'UN',quantity:0,received_quantity:0,unit_cost:0}]);
+ function findProduct(key:number,barcode:string){const p=products.find(p=>p.barcode?.trim()===barcode.trim()&&barcode.trim());if(p)setItem(key,{barcode,product_id:p.id,description:p.name,unit:p.unit||'UN'});else{setItem(key,{barcode,product_id:'',description:''});if(barcode.trim())setNewProduct({key,barcode})}}
+ async function createProduct(){if(!db||!newProduct||!newName.trim())return;setBusy(true);setError('');try{const{data,error}=await db.from('products').insert({barcode:newProduct.barcode,name:newName.trim(),unit:newUnit,cost:0,price:0,stock:0,average_cost:0}).select('id,name,unit').single();if(error)throw error;setItem(newProduct.key,{product_id:data.id,description:data.name,unit:data.unit});setNewProduct(null);setNewName('');await onSaved()}catch(e:any){setError(e.message)}finally{setBusy(false)}}
+ async function save(){if(!db)return;setError('');setMessage('');if(!number.trim()||!supplierId||!items.length){setError('Informe número, fornecedor e ao menos um produto.');return}
+ if(items.some(i=>!i.product_id||i.quantity<0||i.received_quantity<0||i.unit_cost<0||!Number.isFinite(i.unit_cost))){setError('Confira os produtos, quantidades e custos.');return}
+ setBusy(true);let invoiceId:string|undefined;
+ try{
+  const supplier=suppliers.find(s=>s.id===supplierId)!;
+  const total=items.reduce((a,i)=>a+i.quantity*i.unit_cost,0);
+  const{data:invoice,error:invError}=await db.from('invoices').insert({number:number.trim(),document_type:kind,issue_date:issueDate,entry_date:new Date().toISOString().slice(0,10),supplier_id:supplierId,supplier_name:supplier.name,total,status:'draft'}).select('id').single();if(invError)throw invError;invoiceId=invoice.id;
+  const{error:itemError}=await db.from('invoice_items').insert(items.map(i=>({invoice_id:invoiceId,product_id:i.product_id,code:i.barcode,description:i.description,quantity:i.quantity,received_quantity:i.received_quantity,unit:i.unit,unit_cost:i.unit_cost,total:Number((i.quantity*i.unit_cost).toFixed(2))})));if(itemError)throw itemError;
+  const{error:confirmError}=await db.rpc('confirm_manual_entry',{p_invoice_id:invoiceId});if(confirmError)throw confirmError;
+  setMessage('Entrada confirmada e estoque atualizado.');setItems([]);setNumber('');await onSaved();
+ }catch(e:any){setError('Não foi possível confirmar a entrada. '+e.message+(invoiceId?' Um rascunho pode ter sido salvo; não repita sem conferir o histórico.':''))}finally{setBusy(false)}
+ }
+ return <div className="card"><h3>Lançamento manual de mercadorias</h3><p>O estoque só aumenta após confirmar a entrada. Quantidades recebidas podem divergir do documento.</p>
+ <div className="formgrid"><label>Tipo de documento<select value={kind} onChange={e=>setKind(e.target.value)}><option value="MANUAL">Nota manual</option><option value="RECIBO">Recibo</option><option value="NFCe">NFC-e</option><option value="NFE">NF-e sem XML</option><option value="OUTRO">Outro documento</option></select></label><label>Número do documento<input value={number} onChange={e=>setNumber(e.target.value)}/></label><label>Data de emissão<input type="date" value={issueDate} onChange={e=>setIssueDate(e.target.value)}/></label><label>Fornecedor<select value={supplierId} onChange={e=>setSupplierId(e.target.value)}><option value="">Selecione</option>{suppliers.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}</select></label></div>
+ <div className="scroll"><table><thead><tr><th>Código de barras</th><th>Produto</th><th>Un.</th><th>Qtd. documento</th><th>Qtd. recebida</th><th>Custo unitário</th><th>Diferença</th><th></th></tr></thead><tbody>{items.map(i=><tr key={i.key}><td><input style={{minWidth:125}} value={i.barcode} onChange={e=>setItem(i.key,{barcode:e.target.value})} onBlur={()=>findProduct(i.key,i.barcode)} onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();findProduct(i.key,i.barcode)}}}/></td><td><select style={{minWidth:170}} value={i.product_id} onChange={e=>{const p=products.find(p=>p.id===e.target.value);setItem(i.key,{product_id:p?.id||'',description:p?.name||'',unit:p?.unit||'UN',barcode:p?.barcode||''})}}><option value="">Selecione</option>{products.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></td><td>{i.unit}</td><td><input style={{width:90}} type="number" min="0" step="0.001" value={i.quantity} onChange={e=>setItem(i.key,{quantity:Number(e.target.value)})}/></td><td><input style={{width:90}} type="number" min="0" step="0.001" value={i.received_quantity} onChange={e=>setItem(i.key,{received_quantity:Number(e.target.value)})}/></td><td><input style={{width:100}} type="number" min="0" step="0.0001" value={i.unit_cost} onChange={e=>setItem(i.key,{unit_cost:Number(e.target.value)})}/></td><td>{(i.received_quantity-i.quantity).toFixed(3)}</td><td><button className="mini danger" onClick={()=>setItems(old=>old.filter(x=>x.key!==i.key))}>Remover</button></td></tr>)}</tbody></table></div>
+ <p><button className="ghost" onClick={add}>+ Adicionar item</button></p><p><strong>Total do documento: {brl(items.reduce((s,i)=>s+i.quantity*i.unit_cost,0))}</strong></p>
+ {items.some(i=>i.received_quantity!==i.quantity)&&<div className="alert">Atenção: há divergências entre a nota e o recebimento. O estoque receberá apenas a quantidade efetivamente recebida.</div>}
+ {error&&<div className="alert">{error}</div>}{message&&<div className="success">{message}</div>}
+ <button disabled={busy||!items.length} onClick={()=>void save()}>{busy?'Processando...':'Confirmar entrada e atualizar estoque'}</button>
+ {newProduct&&<div className="overlay"><div className="modal"><h3>Produto não encontrado — cadastro rápido</h3><label>Nome<input value={newName} onChange={e=>setNewName(e.target.value)}/></label><label>Unidade<select value={newUnit} onChange={e=>setNewUnit(e.target.value)}><option>UN</option><option>KG</option><option>CX</option><option>PCT</option></select></label><div className="modalactions"><button className="ghost" onClick={()=>setNewProduct(null)}>Cancelar</button><button disabled={busy||!newName.trim()} onClick={()=>void createProduct()}>Cadastrar produto</button></div></div></div>}
+ </div>
+}
